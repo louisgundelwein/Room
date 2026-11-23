@@ -10,12 +10,16 @@ be flat and use external device symbols. Ambiguous instance names,
 malformed native metadata and unsupported geometry or transforms fail
 before record delivery.
 
-The editor stages a complete drawing. It may change values of existing
-instance parameters keyed by their original unique names. Changed names,
-key sets, symbols, positions, drawing objects, globals and built-in
-connectivity controls such as `lab` refuse save. A changed parameter must
-have exactly one original ROOM property. Carriage returns refuse because
-Xschem's disk undo reader strips them.
+The editor stages a complete drawing. Only an existing `value` on `res.sym`,
+`capa.sym` or `ind.sym` (also under `devices/`) is editable. The editor checks
+the symbol's declared type. Labels, pins, directives, custom device parameters
+and other attributes are read-only. The `value` must have exactly one
+original ROOM property.
+
+Use double quotes for spaces and for literal backslashes or double quotes.
+Inside quotes use `\\` for a literal backslash and `\"` for a literal quote.
+Ambiguous unquoted spellings and values that cannot be reopened exactly are
+refused. Carriage returns refuse because Xschem's disk undo reader strips them.
 
 Save patches a copy of the original binary at those property values and
 updates existing native attribute metadata when needed. Explicit nets,

@@ -18,6 +18,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -174,34 +175,51 @@ template<class View> auto originalInstances(View view)
     return view.getCompact().getInstances();
 }
 
-// Parse the exported attribute grammar strictly; ambiguous identities must never be guessed.
-std::map<std::string, std::string> attributes(const std::string &encoded)
+// The scanner accepts only complete tokens, so a leading quote has a matching end.
+std::string attributeValue(const std::string &spelling)
 {
+    if (spelling.front() != '"') return spelling;
+    return room::xschem::decodeString(spelling.substr(1, spelling.size() - 2));
+}
+
+// Keep locked tokens in their original spelling.
+std::map<std::string, std::string> attributes(const std::string &encoded, bool decodeValue = false)
+{
+    const auto space = [](char c) { return c == ' ' || c == '\t' || c == '\n'; };
     const auto body = room::xschem::decodeString(encoded);
     std::map<std::string, std::string> result;
     size_t i = 0;
     while (i < body.size()) {
-        while (i < body.size() && std::isspace(static_cast<unsigned char>(body[i]))) ++i;
+        while (i < body.size() && space(body[i])) ++i;
         if (i == body.size()) break;
         const auto start = i;
-        while (i < body.size() && body[i] != '=' && !std::isspace(static_cast<unsigned char>(body[i]))) ++i;
+        while (i < body.size() && body[i] != '=' && !space(body[i])) ++i;
         if (i == start || i == body.size() || body[i] != '=') throw std::runtime_error("Malformed instance attributes");
         auto key = body.substr(start, i++ - start);
-        std::string value;
+        if (key.find_first_of(";\\\"") != std::string::npos) throw std::runtime_error("Unsupported instance attribute name: " + key);
+        const auto valueStart = i;
         if (i < body.size() && body[i] == '"') {
             ++i;
             while (i < body.size() && body[i] != '"') {
                 if (body[i] == '\\') {
-                    if (++i == body.size()) throw std::runtime_error("Incomplete attribute escape");
+                    if (++i == body.size() || (body[i] != '\\' && body[i] != '"'))
+                        throw std::runtime_error("Unsupported quoted attribute escape: " + key);
                 }
-                value += body[i++];
+                ++i;
             }
             if (i == body.size()) throw std::runtime_error("Unclosed attribute quote");
             ++i;
-            if (i < body.size() && !std::isspace(static_cast<unsigned char>(body[i]))) throw std::runtime_error("Malformed quoted attribute");
+            if (i < body.size() && !space(body[i])) throw std::runtime_error("Malformed quoted attribute");
         } else {
-            while (i < body.size() && !std::isspace(static_cast<unsigned char>(body[i]))) value += body[i++];
+            while (i < body.size() && !space(body[i])) {
+                if (body[i] == '\\' || body[i] == '"' || body[i] == ';')
+                    throw std::runtime_error("Unsupported unquoted attribute spelling: " + key);
+                ++i;
+            }
+            if (i == valueStart) throw std::runtime_error("Empty attribute must be quoted: " + key);
         }
+        auto value = body.substr(valueStart, i - valueStart);
+        if (decodeValue && key == "value") value = attributeValue(value);
         if (!result.emplace(key, value).second) throw std::runtime_error("Duplicate instance attribute: " + key);
     }
     return result;
@@ -211,8 +229,9 @@ std::string identity(const Record &r)
 {
     const auto props = attributes(r.attributes);
     const auto it = props.find("name");
-    if (it == props.end() || it->second.empty()) throw std::runtime_error("Every ROOM instance needs a unique nonempty name");
-    return it->second;
+    auto name = it == props.end() ? std::string{} : attributeValue(it->second);
+    if (name.empty()) throw std::runtime_error("Every ROOM instance needs a unique nonempty name");
+    return name;
 }
 
 // Xschem emits empty optional sections and orders wire endpoints on load.
@@ -243,7 +262,7 @@ bool equal(const Record &a, const Record &b, bool compareParameterValues = false
     if (a.kind != b.kind || a.layer != b.layer || a.rotation != b.rotation || a.flip != b.flip ||
         a.text != b.text || a.values.size() != b.values.size()) return false;
     if (compareParameterValues && a.kind == 'C') {
-        if (attributes(a.attributes) != attributes(b.attributes)) return false;
+        if (attributes(a.attributes, true) != attributes(b.attributes, true)) return false;
     } else if (a.attributes != b.attributes) return false;
     for (size_t i = 0; i < a.values.size(); ++i) if (a.values[i] != b.values[i]) return false;
     return true;
@@ -394,6 +413,15 @@ int rx_append(rx_document *doc, const rx_record *r, rx_error **error)
     return ok;
 }
 
+const char *rx_value_symbol_type(rx_string symbol)
+{
+    const std::string_view name(symbol.data ? symbol.data : "", symbol.data ? symbol.size : 0);
+    if (name == "res.sym" || name == "devices/res.sym") return "resistor";
+    if (name == "capa.sym" || name == "devices/capa.sym") return "capacitor";
+    if (name == "ind.sym" || name == "devices/ind.sym") return "inductor";
+    return nullptr;
+}
+
 int rx_commit(rx_document *doc, rx_error **error)
 {
     return boundary(doc, error, [&] {
@@ -425,7 +453,7 @@ int rx_commit(rx_document *doc, rx_error **error)
             auto geometry = *it->second;
             geometry.attributes = old.attributes;
             if (!equal(geometry, old)) throw std::runtime_error(refusal);
-            const auto before = attributes(old.attributes), after = attributes(it->second->attributes);
+            const auto before = attributes(old.attributes, true), after = attributes(it->second->attributes, true);
             if (before.size() != after.size()) throw std::runtime_error(refusal);
             if (before == after) continue;
             const auto index = doc->identities.at(name);
@@ -446,11 +474,8 @@ int rx_commit(rx_document *doc, rx_error **error)
                 const auto next = after.find(key);
                 if (next == after.end()) throw std::runtime_error(refusal);
                 if (next->second == value) continue;
-                if (key == "lab" || key == "embed" || key == "schematic" || key == "symbol" ||
-                    key == "spice_ignore" || key == "verilog_ignore" || key == "vhdl_ignore" ||
-                    key == "tedax_ignore" || key == "spectre_ignore" || key == "lvs_ignore" ||
-                    key.rfind("xschem.native.", 0) == 0 || key.rfind("core.", 0) == 0 || key.rfind("qucs.", 0) == 0)
-                    throw std::runtime_error("Structural attribute cannot be changed: " + key);
+                if (key != "value" || !rx_value_symbol_type(borrowed(old.text)))
+                    throw std::runtime_error("Instance attribute is read-only: " + name + "." + key);
                 set(key, next->second, true);
             }
             set("xschem.native.attributes", it->second->attributes, false);
