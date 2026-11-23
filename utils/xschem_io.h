@@ -23,6 +23,23 @@ namespace room::xschem {
 
 
 
+// Typed editor records; coordinates are Xschem units, strings contain no outer braces.
+struct Record {
+    char kind = 0;
+    int layer = 0, rotation = 0, flip = 0;
+    std::vector<double> values;
+    std::string text, attributes;
+};
+
+// Encode/decode the outer Xschem string layer (save/load_ascii_string rules).
+std::string encodeString(const std::string &value);
+std::string decodeString(const std::string &value);
+
+// Collect the same mapped objects used by the text exporter, without text serialization.
+std::vector<Record> collectRecords(const Cell &cell, const CellContent &content, bool native = false);
+Record parseRecord(const std::string &record);
+void formatRecord(std::ostream &out, const Record &record);
+
 std::vector<std::string> readRecords(const std::string &path, std::vector<std::string> &errors);
 std::vector<std::string> readRecordsFromText(const std::string &text, std::vector<std::string> &errors);
 

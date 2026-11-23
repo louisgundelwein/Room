@@ -23,7 +23,9 @@ option(ROOM_BUILD_XSCHEM_TCL "Build Tcl extension (roomtcl.so) for in-process Xs
 # binary dir still installs libraries/headers needed by packaging.
 option(ROOM_INSTALL "Install ROOM libraries, headers, and CMake package" ${_ROOM_TOP_LEVEL})
 
-if(ROOM_BUILD_XSCHEM_TCL)
+option(ROOM_BUILD_XSCHEM_NATIVE "Build typed Xschem adapter" OFF)
+
+if(ROOM_BUILD_XSCHEM_TCL OR ROOM_BUILD_XSCHEM_NATIVE)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
@@ -263,4 +265,8 @@ endif()
 option(ROOM_BUILD_PYTHON "Build ROOM Python bindings (room_c + ctypes package)" ON)
 if(ROOM_BUILD_PYTHON)
     add_subdirectory(python)
+endif()
+
+if(ROOM_BUILD_XSCHEM_NATIVE)
+    add_subdirectory(integrations/xschem_native)
 endif()

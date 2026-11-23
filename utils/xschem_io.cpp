@@ -4,6 +4,7 @@
  *****************************************************************************************/
 
 #include "xschem_io.h"
+#include <stdexcept>
 
 #include "coord_scale.h"
 #include "net.h"
@@ -763,7 +764,7 @@ bool attrValueNeedsQuotes(const std::string &value)
         return true;
     }
     for (const char ch : value) {
-        if (std::isspace(static_cast<unsigned char>(ch)) || ch == '{' || ch == '}') {
+        if (std::isspace(static_cast<unsigned char>(ch)) || ch == '{' || ch == '}' || ch == '"' || ch == '\\') {
             return true;
         }
     }
@@ -775,8 +776,8 @@ std::string quoteAttrValue(const std::string &value)
     std::ostringstream oss;
     oss << '"';
     for (const char ch : value) {
-        if (ch == '"') {
-            oss << '\\' << '"';
+        if (ch == '"' || ch == '\\') {
+            oss << '\\' << ch;
         } else {
             oss << ch;
         }
@@ -1324,15 +1325,13 @@ void parseMetadataRecord(char kind, const std::string &raw, Cell &cell, CellCont
                 block.size() >= 2 ? block.substr(1, block.size() - 2) : "");
 }
 
-void writeVersionRecord(std::ostream &out, const SourceInfo &info)
+void writeVersionRecord(std::vector<Record> &out, const SourceInfo &info)
 {
-    out << "v {xschem";
-    out << " version=" << (info.toolVersion().empty() ? "3.4.4" : info.toolVersion());
-    out << " file_version=" << (info.fileVersion().empty() ? "1.2" : info.fileVersion());
-    if (!info.comments().empty()) {
-        out << '\n' << info.comments();
-    }
-    out << "}\n";
+    Record r; r.kind = 'v';
+    r.attributes = "xschem version=" + (info.toolVersion().empty() ? "3.4.4" : info.toolVersion())
+        + " file_version=" + (info.fileVersion().empty() ? "1.2" : info.fileVersion());
+    if (!info.comments().empty()) r.attributes += "\n" + info.comments();
+    out.push_back(std::move(r));
 }
 
 void normalizeSubcircuitMetadata(std::vector<Property> &props)
@@ -1355,26 +1354,29 @@ void normalizeSubcircuitMetadata(std::vector<Property> &props)
     }
 }
 
-void writeSectionRecord(std::ostream &out, char kind, const std::string &body) { out << kind << " {" << body << "}\n"; }
-
-void writeNetRecord(std::ostream &out, const Shape::PathData &path, const std::vector<Property> &props)
+std::string attributeBody(const std::vector<Property> &props)
 {
-    out << 'N' << ' ';
-    writeCoord(out, path.points[0].x);
-    out << ' ';
-    writeCoord(out, path.points[0].y);
-    out << ' ';
-    writeCoord(out, path.points[1].x);
-    out << ' ';
-    writeCoord(out, path.points[1].y);
-    if (const std::string *lab = findProperty(props, "lab")) {
-        out << " {lab=" << *lab << "}";
-    } else if (const std::string *lab = findProperty(props, "label")) {
-        out << " {lab=" << *lab << "}";
-    } else {
-        out << " {}";
+    if (const auto *raw = findProperty(props, "xschem.native.attributes")) return *raw;
+    auto formatted = formatAttrBlock(props);
+    return encodeString(formatted.substr(1, formatted.size() - 2));
+}
+
+void writeSectionRecord(std::vector<Record> &out, char kind, const std::string &body)
+{
+    Record r; r.kind = kind; r.attributes = body; out.push_back(std::move(r));
+}
+
+void writeNetRecord(std::vector<Record> &out, const Shape::PathData &path, const std::vector<Property> &props)
+{
+    Record r; r.kind = 'N';
+    for (const auto &p : {path.points.at(0), path.points.at(1)}) {
+        r.values.push_back(dbuToEditorUnits(p.x, g_dbuPerEditorUnit));
+        r.values.push_back(dbuToEditorUnits(p.y, g_dbuPerEditorUnit));
     }
-    out << '\n';
+    if (const auto *lab = findProperty(props, "lab")) r.attributes = "lab=" + *lab;
+    else if (const auto *lab = findProperty(props, "label")) r.attributes = "lab=" + *lab;
+    if (const auto *raw = findProperty(props, "xschem.native.attributes")) r.attributes = *raw;
+    out.push_back(std::move(r));
 }
 
 bool pointNear(const Point &a, std::int64_t x, std::int64_t y, std::int64_t tol)
@@ -1464,17 +1466,14 @@ void applyGndLabelsToWireProps(const Block &block, double dbuPerEditorUnit,
     }
 }
 
-void writeLineRecord(std::ostream &out, const Shape::PathData &path)
+void writeLineRecord(std::vector<Record> &out, const Shape::PathData &path)
 {
-    out << 'L' << ' ' << path.width << ' ';
-    writeCoord(out, path.points[0].x);
-    out << ' ';
-    writeCoord(out, path.points[0].y);
-    out << ' ';
-    writeCoord(out, path.points[1].x);
-    out << ' ';
-    writeCoord(out, path.points[1].y);
-    out << " {}\n";
+    Record r; r.kind = 'L'; r.layer = path.width;
+    for (const auto &p : {path.points.at(0), path.points.at(1)}) {
+        r.values.push_back(dbuToEditorUnits(p.x, g_dbuPerEditorUnit));
+        r.values.push_back(dbuToEditorUnits(p.y, g_dbuPerEditorUnit));
+    }
+    out.push_back(std::move(r));
 }
 
 int parseOptionalIntProperty(const std::vector<Property> &props, const char *name)
@@ -1489,10 +1488,18 @@ int parseOptionalIntProperty(const std::vector<Property> &props, const char *nam
     return 0;
 }
 
-void writeTextRecord(std::ostream &out, const Shape::TextData &text, const std::vector<Property> &props)
+// Native metadata is a group: missing companions are corrupt input, not defaults.
+const std::string &requiredNativeProperty(const std::vector<Property> &props, const char *key)
 {
-    const int rotate = parseOptionalIntProperty(props, "rotate");
-    const int mirror = parseOptionalIntProperty(props, "mirror");
+    const auto *value = findProperty(props, key);
+    if (!value) throw std::runtime_error(std::string("Incomplete native metadata: missing ") + key);
+    return *value;
+}
+
+void writeTextRecord(std::vector<Record> &out, const Shape::TextData &text, const std::vector<Property> &props)
+{
+    const int rotate = parseOptionalIntProperty(props, findProperty(props, "xschem.native.rotate") ? "xschem.native.rotate" : "rotate");
+    const int mirror = parseOptionalIntProperty(props, findProperty(props, "xschem.native.flip") ? "xschem.native.flip" : "mirror");
     auto qucsTextSize = [](const std::string &token) -> std::optional<double> {
         try {
             const double value = std::stod(token);
@@ -1524,27 +1531,29 @@ void writeTextRecord(std::ostream &out, const Shape::TextData &text, const std::
     } else {
         sizeY = sizeX;
     }
-    out << 'T' << ' ' << '{' << text.text << '}' << ' ';
-    writeCoord(out, text.position.x);
-    out << ' ';
-    writeCoord(out, text.position.y);
-    out << ' ' << rotate << ' ' << mirror << ' ' << sizeX << ' ' << sizeY << " {}\n";
-}
-
-void writePolygonRecord(std::ostream &out, const Shape::PolygonData &polygon, const std::vector<Property> &props)
-{
-    const int layer = findProperty(props, "xschemLayer") ? std::stoi(*findProperty(props, "xschemLayer")) : 4;
-    out << 'P' << ' ' << layer << ' ' << polygon.points.size();
-    for (const Point &pt : polygon.points) {
-        out << ' ';
-        writeCoord(out, pt.x);
-        out << ' ';
-        writeCoord(out, pt.y);
+    Record r; r.kind = 'T'; r.text = text.text; r.rotation = rotate; r.flip = mirror;
+    r.values = {dbuToEditorUnits(text.position.x, g_dbuPerEditorUnit),
+                dbuToEditorUnits(text.position.y, g_dbuPerEditorUnit), sizeX, sizeY};
+    if (const auto *sx = findProperty(props, "xschem.native.sizeX")) {
+        r.values[2] = std::stod(*sx);
+        r.values[3] = std::stod(requiredNativeProperty(props, "xschem.native.sizeY"));
+        r.attributes = requiredNativeProperty(props, "xschem.native.attributes");
     }
-    out << " {}\n";
+    out.push_back(std::move(r));
 }
 
-void writePinRecord(std::ostream &out, const Shape::RectData &rect, const std::vector<Property> &props)
+void writePolygonRecord(std::vector<Record> &out, const Shape::PolygonData &polygon, const std::vector<Property> &props)
+{
+    Record r; r.kind = 'P';
+    r.layer = findProperty(props, "xschemLayer") ? std::stoi(*findProperty(props, "xschemLayer")) : 4;
+    for (const auto &p : polygon.points) {
+        r.values.push_back(dbuToEditorUnits(p.x, g_dbuPerEditorUnit));
+        r.values.push_back(dbuToEditorUnits(p.y, g_dbuPerEditorUnit));
+    }
+    out.push_back(std::move(r));
+}
+
+void writePinRecord(std::vector<Record> &out, const Shape::RectData &rect, const std::vector<Property> &props)
 {
     const int width = findProperty(props, "pinWidth") ? std::stoi(*findProperty(props, "pinWidth")) : 5;
     // Device/subckt pins use name= (+ optional pinnumber). Emitting lab= on those B-rects
@@ -1570,15 +1579,12 @@ void writePinRecord(std::ostream &out, const Shape::RectData &rect, const std::v
     };
     const std::int64_t dx = snapOffset(rect.box.llx, rect.box.urx);
     const std::int64_t dy = snapOffset(rect.box.lly, rect.box.ury);
-    out << 'B' << ' ' << width << ' ';
-    writeCoord(out, rect.box.llx + dx);
-    out << ' ';
-    writeCoord(out, rect.box.lly + dy);
-    out << ' ';
-    writeCoord(out, rect.box.urx + dx);
-    out << ' ';
-    writeCoord(out, rect.box.ury + dy);
-    out << ' ' << formatAttrBlock(pinProps) << '\n';
+    Record r; r.kind = 'B'; r.layer = width;
+    r.values = {dbuToEditorUnits(rect.box.llx + dx, g_dbuPerEditorUnit),
+                dbuToEditorUnits(rect.box.lly + dy, g_dbuPerEditorUnit),
+                dbuToEditorUnits(rect.box.urx + dx, g_dbuPerEditorUnit),
+                dbuToEditorUnits(rect.box.ury + dy, g_dbuPerEditorUnit)};
+    r.attributes = attributeBody(pinProps); out.push_back(std::move(r));
 }
 
 void normalizeArcAnglesForXschem(double &startAngle, double &endAngle)
@@ -1594,7 +1600,7 @@ void normalizeArcAnglesForXschem(double &startAngle, double &endAngle)
     }
 }
 
-void writeArcRecord(std::ostream &out, const Shape::ArcData &arc, const std::vector<Property> &props)
+void writeArcRecord(std::vector<Record> &out, const Shape::ArcData &arc, const std::vector<Property> &props)
 {
     double startAngle = arc.startAngle;
     double endAngle = arc.endAngle;
@@ -1608,11 +1614,15 @@ void writeArcRecord(std::ostream &out, const Shape::ArcData &arc, const std::vec
         }
         arcProps.push_back(prop);
     }
-    out << 'A' << ' ' << arc.width << ' ' << cx << ' ' << cy << ' ' << arc.radius << ' ' << startAngle << ' '
-        << endAngle << ' ' << formatAttrBlock(arcProps) << '\n';
+    Record r; r.kind = 'A'; r.layer = arc.width;
+    r.values = {cx, cy, arc.radius, startAngle, endAngle};
+    if (findProperty(props, "xschem.native.angles")) {
+        r.values[3] = arc.startAngle; r.values[4] = arc.endAngle;
+    }
+    r.attributes = attributeBody(arcProps); out.push_back(std::move(r));
 }
 
-void writeArcFromPath(std::ostream &out, const Shape::PathData &path, const std::vector<Property> &props)
+void writeArcFromPath(std::vector<Record> &out, const Shape::PathData &path, const std::vector<Property> &props)
 {
     Shape::ArcData arc;
     arc.layerId = path.layerId;
@@ -1638,7 +1648,7 @@ void writeArcFromPath(std::ostream &out, const Shape::PathData &path, const std:
     writeArcRecord(out, arc, props);
 }
 
-void writeComponentRecord(std::ostream &out, const Instance &inst)
+void writeComponentRecord(std::vector<Record> &out, const Instance &inst)
 {
     int rotate = 0;
     int mirror = 0;
@@ -1658,11 +1668,10 @@ void writeComponentRecord(std::ostream &out, const Instance &inst)
     }
 
     xschemFromOrient(orient, rotate, mirror);
-    out << 'C' << " {" << inst.cellName() << "} ";
-    writeCoord(out, inst.transform().x);
-    out << ' ';
-    writeCoord(out, inst.transform().y);
-    out << ' ' << rotate << ' ' << mirror << ' ' << formatAttrBlock(inst.properties()) << '\n';
+    Record r; r.kind = 'C'; r.text = inst.cellName(); r.rotation = rotate; r.flip = mirror;
+    r.values = {dbuToEditorUnits(inst.transform().x, g_dbuPerEditorUnit),
+                dbuToEditorUnits(inst.transform().y, g_dbuPerEditorUnit)};
+    r.attributes = attributeBody(inst.properties()); out.push_back(std::move(r));
 }
 
 std::string toLowerAscii(std::string value)
@@ -2588,11 +2597,12 @@ void importRecords(const std::vector<std::string> &records, Cell &cell, CellCont
     syncDualToolGraphProperties(block, content, GraphSyncDirection::FromXschemGraph);
 }
 
-void exportRecords(std::ostream &out, const Cell &cell, const CellContent &content)
+std::vector<Record> collectRecords(const Cell &cell, const CellContent &content, bool native)
 {
+    std::vector<Record> out;
     CellContent working = content;
-    const bool fromQucs = working.sourceInfo().format() == "qucs" || working.sourceInfo().format() == "qucs_s"
-        || blockLooksQucsNative(working.block());
+    const bool fromQucs = !native && (working.sourceInfo().format() == "qucs" || working.sourceInfo().format() == "qucs_s"
+        || blockLooksQucsNative(working.block()));
     if (fromQucs) {
         // Qucs diagram geometry is authoritative when opening in Xschem (fixes stale section.graph).
         syncDualToolGraphProperties(working.block(), working, GraphSyncDirection::FromQucsDiagram);
@@ -2604,16 +2614,18 @@ void exportRecords(std::ostream &out, const Cell &cell, const CellContent &conte
     g_dbuPerEditorUnit = effectiveDbuPerEditorUnit(working);
 
     PrimitiveResolver resolver;
-    resolver.loadFromEnvironment();
-    canonicalizeBlockPrimitives(working.block(), &resolver);
-    propagateNetNames(working.block(), &resolver, g_dbuPerEditorUnit);
+    if (!native) {
+        resolver.loadFromEnvironment();
+        canonicalizeBlockPrimitives(working.block(), &resolver);
+        propagateNetNames(working.block(), &resolver, g_dbuPerEditorUnit);
+    }
 
     writeVersionRecord(out, working.sourceInfo());
     if (working.viewType() == ViewType::Symbol && isAnalogLibControllerSymbol(cell.name())) {
         // Xschem applies type/format from K (not G) for netlist_commands.
         writeSectionRecord(out, 'G', "");
     } else if (!cell.properties().empty()) {
-        out << 'G' << ' ' << formatAttrBlock(cell.properties()) << '\n';
+        writeSectionRecord(out, 'G', attributeBody(cell.properties()));
     } else {
         writeSectionRecord(out, 'G', "");
     }
@@ -2632,7 +2644,7 @@ void exportRecords(std::ostream &out, const Cell &cell, const CellContent &conte
     }
     if (!kProps.empty()) {
         normalizeSubcircuitMetadata(kProps);
-        out << 'K' << ' ' << formatAttrBlock(kProps) << '\n';
+        writeSectionRecord(out, 'K', attributeBody(kProps));
     }
 
     const std::string *sectionV = findProperty(working.properties(), std::string(kSectionPrefix) + "v");
@@ -2697,6 +2709,7 @@ void exportRecords(std::ostream &out, const Cell &cell, const CellContent &conte
         if (purpose == LayerPurpose::Wire) {
             continue;
         }
+        const auto before = out.size();
         switch (shape.type()) {
         case Shape::Type::Path:
             if (findProperty(shape.properties(), "geometry") != nullptr) {
@@ -2712,7 +2725,7 @@ void exportRecords(std::ostream &out, const Cell &cell, const CellContent &conte
             writePolygonRecord(out, *shape.polygon(), shape.properties());
             break;
         case Shape::Type::Rect:
-            if (purpose == LayerPurpose::Pin) {
+            if (purpose == LayerPurpose::Pin || findProperty(shape.properties(), "xschem.native.attributes")) {
                 writePinRecord(out, *shape.rect(), shape.properties());
             }
             break;
@@ -2721,6 +2734,18 @@ void exportRecords(std::ostream &out, const Cell &cell, const CellContent &conte
             break;
         default:
             break;
+        }
+        if (out.size() > before) {
+            if (const auto *raw = findProperty(shape.properties(), "xschem.native.attributes")) {
+                out.back().attributes = *raw;
+                out.back().layer = std::stoi(requiredNativeProperty(shape.properties(), "xschem.native.layer"));
+                if (shape.rect()) {
+                    const auto &box = shape.rect()->box;
+                    out.back().values = {dbuToEditorUnits(box.llx, g_dbuPerEditorUnit),
+                        dbuToEditorUnits(box.lly, g_dbuPerEditorUnit), dbuToEditorUnits(box.urx, g_dbuPerEditorUnit),
+                        dbuToEditorUnits(box.ury, g_dbuPerEditorUnit)};
+                }
+            }
         }
     }
 
@@ -2734,7 +2759,7 @@ void exportRecords(std::ostream &out, const Cell &cell, const CellContent &conte
             || cell.find("launcher") != std::string::npos) {
             hasLauncher = true;
         }
-        if (fromQucs || instanceNeedsQucsExportRemap(inst)) {
+        if (!native && !findProperty(inst.properties(), "xschem.native.attributes") && (fromQucs || instanceNeedsQucsExportRemap(inst))) {
             Instance exported = instanceForQucsExport(inst);
             if (const std::string *val = findProperty(exported.properties(), "value")) {
                 const std::string raw = extractWriteRawFile(*val);
@@ -2769,10 +2794,7 @@ void exportRecords(std::ostream &out, const Cell &cell, const CellContent &conte
 
     if (!hasLauncher) {
         if (const std::string *storedLauncher = findProperty(working.properties(), "section.launcher")) {
-            out << *storedLauncher;
-            if (storedLauncher->empty() || storedLauncher->back() != '\n') {
-                out << '\n';
-            }
+            out.push_back(parseRecord(*storedLauncher));
             hasLauncher = true;
         }
     }
@@ -2799,11 +2821,108 @@ void exportRecords(std::ostream &out, const Cell &cell, const CellContent &conte
     }
 
     if (graphRecord) {
-        out << *graphRecord;
-        if (graphRecord->empty() || graphRecord->back() != '\n') {
-            out << '\n';
+        out.push_back(parseRecord(*graphRecord));
+    }
+    for (const char kind : std::string("vGKVSEF")) {
+        if (const auto *raw = findProperty(content.properties(), std::string("editor.xschem.") + kind)) {
+            auto it = std::find_if(out.begin(), out.end(), [kind](const Record &r) { return r.kind == kind; });
+            if (it != out.end()) it->attributes = *raw;
+            else writeSectionRecord(out, kind, *raw);
         }
     }
+    return out;
+}
+
+// Parse a legacy stored graph/launcher record, or an oracle exporter record.
+Record parseRecord(const std::string &raw)
+{
+    Record r;
+    std::istringstream in(raw);
+    if (!(in >> r.kind)) throw std::runtime_error("Empty Xschem record");
+    auto body = [&]() {
+        in >> std::ws;
+        if (in.get() != '{') throw std::runtime_error("Expected braced Xschem string");
+        std::string value; int depth = 1; char c; bool escaped = false;
+        while (in.get(c)) {
+            if (!escaped && c == '{') ++depth;
+            if (!escaped && c == '}' && --depth == 0) return value;
+            value += c;
+            if (c == '\\' && !escaped) escaped = true; else escaped = false;
+        }
+        throw std::runtime_error("Unterminated Xschem string");
+    };
+    if (std::string("vGKVSEF").find(r.kind) != std::string::npos) r.attributes = body();
+    else {
+        int count = 0;
+        if (r.kind == 'C' || r.kind == 'T') r.text = body();
+        if (std::string("LBAP").find(r.kind) != std::string::npos) in >> r.layer;
+        switch (r.kind) {
+        case 'C': count = 2; break;
+        case 'T': count = 2; break;
+        case 'N': case 'L': case 'B': count = 4; break;
+        case 'A': count = 5; break;
+        case 'P': in >> count; if (count < 2 || count > 1000000) throw std::runtime_error("Invalid polygon size"); count *= 2; break;
+        default: throw std::runtime_error("Unsupported Xschem record");
+        }
+        for (int i = 0; i < count; ++i) {
+            double v;
+            if (!(in >> v)) throw std::runtime_error("Missing Xschem coordinate");
+            r.values.push_back(v);
+        }
+        if (r.kind == 'C' || r.kind == 'T') {
+            if (!(in >> r.rotation >> r.flip)) throw std::runtime_error("Missing Xschem orientation");
+        }
+        if (r.kind == 'T') {
+            double sx, sy;
+            if (!(in >> sx >> sy)) throw std::runtime_error("Missing text scales");
+            r.values.push_back(sx); r.values.push_back(sy);
+        }
+        r.attributes = body();
+    }
+    return r;
+}
+
+// Use schematic escaping, preserving every byte for exact native validation.
+std::string encodeString(const std::string &value)
+{
+    std::string out;
+    for (char c : value) {
+        if (c == '\\' || c == '{' || c == '}') out += '\\';
+        out += c;
+    }
+    return out;
+}
+
+std::string decodeString(const std::string &value)
+{
+    std::string out;
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '\\' && i + 1 < value.size()) ++i;
+        out += value[i];
+    }
+    return out;
+}
+
+void formatRecord(std::ostream &out, const Record &r)
+{
+    out << r.kind;
+    if (std::string("vGKVSEF").find(r.kind) == std::string::npos) {
+        if (r.kind == 'C' || r.kind == 'T') out << " {" << r.text << '}';
+        if (std::string("LBAP").find(r.kind) != std::string::npos) out << ' ' << r.layer;
+        if (r.kind == 'P') out << ' ' << r.values.size() / 2;
+        for (std::size_t i = 0; i < r.values.size(); ++i) {
+            if (i == 2 && r.kind == 'T') out << ' ' << r.rotation << ' ' << r.flip;
+            out << ' ' << std::setprecision(12) << r.values[i];
+        }
+        if (r.kind == 'C') out << ' ' << r.rotation << ' ' << r.flip;
+    }
+    out << " {" << r.attributes << "}\n";
+}
+
+// Format the shared collected records for the text exporter.
+void exportRecords(std::ostream &out, const Cell &cell, const CellContent &content)
+{
+    for (const auto &r : collectRecords(cell, content)) formatRecord(out, r);
 }
 
 } // namespace room::xschem
