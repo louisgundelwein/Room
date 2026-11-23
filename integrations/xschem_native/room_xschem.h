@@ -24,13 +24,15 @@ typedef int (*rx_record_callback)(void *, const rx_record *);
 int rx_open(rx_string path, rx_document **out, rx_error **error);
 /* Read the sole schematic, or the one matching <cell>.schematic.room. */
 int rx_read(rx_document *, rx_record_callback, void *, rx_error **);
-/* Expected Xschem type for an editable device reference, or NULL for a read-only symbol. */
+/* Expected type for a supported reference spelling. This does not verify its loaded definition. */
 const char *rx_value_symbol_type(rx_string symbol);
 /* Stage the whole editor snapshot; only existing `value` attributes on editable devices may change.
  * Unique names captured by read are immutable identities. Attribute keys cannot change.
  * A failed append invalidates staging. A failed commit leaves the original file intact. */
 int rx_begin(rx_document *, rx_error **);
 int rx_append(rx_document *, const rx_record *, rx_error **);
+/* Stage a C record whose linked symbol definition the editor has verified. */
+int rx_append_verified_instance(rx_document *, const rx_record *, rx_error **);
 int rx_commit(rx_document *, rx_error **);
 void rx_close(rx_document *);
 rx_string rx_error_message(const rx_error *);

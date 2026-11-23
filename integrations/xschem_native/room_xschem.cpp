@@ -34,6 +34,7 @@ struct rx_document {
     bool staging = false;
     size_t ci = 0, vi = 0;
     std::vector<Record> staged, baseline;
+    std::set<size_t> verifiedInstances;
     std::map<std::string, size_t> identities;
 };
 
@@ -396,10 +397,10 @@ int rx_begin(rx_document *doc, rx_error **error)
 {
     return boundary(doc, error, [&] {
         require(doc); if (doc->cell.empty()) throw std::runtime_error("Read a cell before staging");
-        doc->staged.clear(); doc->staging = true;
+        doc->staged.clear(); doc->verifiedInstances.clear(); doc->staging = true;
     });
 }
-int rx_append(rx_document *doc, const rx_record *r, rx_error **error)
+static int appendRecord(rx_document *doc, const rx_record *r, bool verified, rx_error **error)
 {
     const int ok = boundary(doc, error, [&] {
         require(doc); if (!doc->staging || !r) throw std::runtime_error("No staging operation");
@@ -407,10 +408,24 @@ int rx_append(rx_document *doc, const rx_record *r, rx_error **error)
         Record v; v.kind = r->kind; v.layer = r->layer; v.rotation = r->rotation; v.flip = r->flip;
         if (r->value_count) v.values.assign(r->values, r->values + r->value_count);
         v.text = string(r->text); v.attributes = string(r->attributes); validate(v);
+        if (verified) {
+            if (v.kind != 'C') throw std::runtime_error("Symbol verification requires an instance");
+            doc->verifiedInstances.insert(doc->staged.size());
+        }
         doc->staged.push_back(std::move(v));
     });
     if (!ok && doc) doc->staging = false;
     return ok;
+}
+
+int rx_append(rx_document *doc, const rx_record *r, rx_error **error)
+{
+    return appendRecord(doc, r, false, error);
+}
+
+int rx_append_verified_instance(rx_document *doc, const rx_record *r, rx_error **error)
+{
+    return appendRecord(doc, r, true, error);
 }
 
 const char *rx_value_symbol_type(rx_string symbol)
@@ -434,9 +449,10 @@ int rx_commit(rx_document *doc, rx_error **error)
             !std::equal(beforeDrawing.begin(), beforeDrawing.end(), afterDrawing.begin(),
                 [](const Record &a, const Record &b) { return equal(a, b); }))
             throw std::runtime_error(refusal);
-        std::map<std::string, const Record *> edited;
-        for (const auto &r : doc->staged) if (r.kind == 'C') {
-            if (!edited.emplace(identity(r), &r).second) throw std::runtime_error(refusal);
+        std::map<std::string, size_t> edited;
+        for (size_t i = 0; i < doc->staged.size(); ++i) {
+            const auto &r = doc->staged[i];
+            if (r.kind == 'C' && !edited.emplace(identity(r), i).second) throw std::runtime_error(refusal);
         }
         if (edited.size() != doc->identities.size()) throw std::runtime_error(refusal);
 
@@ -450,10 +466,11 @@ int rx_commit(rx_document *doc, rx_error **error)
             const auto name = identity(old);
             const auto it = edited.find(name);
             if (it == edited.end()) throw std::runtime_error(refusal);
-            auto geometry = *it->second;
+            const auto &staged = doc->staged[it->second];
+            auto geometry = staged;
             geometry.attributes = old.attributes;
             if (!equal(geometry, old)) throw std::runtime_error(refusal);
-            const auto before = attributes(old.attributes, true), after = attributes(it->second->attributes, true);
+            const auto before = attributes(old.attributes, true), after = attributes(staged.attributes, true);
             if (before.size() != after.size()) throw std::runtime_error(refusal);
             if (before == after) continue;
             const auto index = doc->identities.at(name);
@@ -474,12 +491,13 @@ int rx_commit(rx_document *doc, rx_error **error)
                 const auto next = after.find(key);
                 if (next == after.end()) throw std::runtime_error(refusal);
                 if (next->second == value) continue;
-                if (key != "value" || !rx_value_symbol_type(borrowed(old.text)))
+                if (key != "value" || !rx_value_symbol_type(borrowed(old.text)) ||
+                    !doc->verifiedInstances.count(it->second))
                     throw std::runtime_error("Instance attribute is read-only: " + name + "." + key);
                 set(key, next->second, true);
             }
-            set("xschem.native.attributes", it->second->attributes, false);
-            old.attributes = it->second->attributes;
+            set("xschem.native.attributes", staged.attributes, false);
+            old.attributes = staged.attributes;
         }
         if (patches.empty()) { doc->staging = false; return; }
         WriterLock lock(doc->path);

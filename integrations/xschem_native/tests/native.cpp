@@ -52,12 +52,16 @@ std::vector<Record> read(Document &doc)
     std::vector<Record> result; rx_error *e = nullptr;
     int ok = rx_read(doc.doc, collect, &result, &e); checked(ok, e); return result;
 }
-void stage(Document &doc, const std::vector<Record> &records)
+void stage(Document &doc, const std::vector<Record> &records, bool verifyDevices = true)
 {
     rx_error *e = nullptr; int ok = rx_begin(doc.doc, &e); checked(ok, e);
     for (const auto &v : records) {
         rx_record r{v.kind, v.layer, v.rotation, v.flip, v.values.data(), v.values.size(), str(v.text), str(v.attributes)};
-        ok = rx_append(doc.doc, &r, &e); checked(ok, e);
+        // Simulate editor verification. Loaded symbol identity is covered by the editor regression.
+        ok = verifyDevices && v.kind == 'C' && rx_value_symbol_type(r.text)
+           ? rx_append_verified_instance(doc.doc, &r, &e)
+           : rx_append(doc.doc, &r, &e);
+        checked(ok, e);
     }
 }
 std::string bytes(const fs::path &path)
@@ -201,9 +205,9 @@ void saves(const fs::path &target, bool compact)
     std::cout << "PASS unknown selected-payload data preserved through parameter save\n";
     // Every prohibited state change must fail without changing even one original byte.
     const auto baseline = read(reopened);
-    auto refuse = [&](std::vector<Record> edited, const std::string &label) {
+    auto refuse = [&](std::vector<Record> edited, const std::string &label, bool verifyDevices = true) {
         const auto originalBytes = bytes(target);
-        stage(reopened, edited); rx_error *error = nullptr;
+        stage(reopened, edited, verifyDevices); rx_error *error = nullptr;
         const int result = rx_commit(reopened.doc, &error);
         require(!result, "Accepted forbidden edit: " + label);
         auto msg = rx_error_message(error);
@@ -215,6 +219,10 @@ void saves(const fs::path &target, bool compact)
         auto edited = baseline; change(edited); refuse(edited, label);
     };
     auto instance = [](auto &records) -> Record & { return *std::find_if(records.begin(), records.end(), [](const auto &r) { return r.kind == 'C'; }); };
+    auto unverified = baseline;
+    auto &unverifiedDevice = instance(unverified);
+    unverifiedDevice.attributes = "name=R1 value=123456";
+    refuse(std::move(unverified), "value on an unverified symbol", false);
     mutate("added instance", [&](auto &r) { auto v = instance(r); v.attributes = "name=R2 value=2k"; r.push_back(v); });
     mutate("deleted instance", [&](auto &r) { r.erase(std::find_if(r.begin(), r.end(), [](const auto &v) { return v.kind == 'C'; })); });
     mutate("tiny move", [&](auto &r) { for (auto &v : r) if (v.kind == 'C') v.values[0] += 1e-10; });
