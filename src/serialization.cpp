@@ -610,7 +610,8 @@ void writeViewPayload(schema::ViewPayload::Builder payload,
     }
     case ViewType::Symbol: {
         auto symbol = payload.initSymbol();
-        writeViewTopology(symbol, layers, block, compactGeometry, detectRepetition);
+        // Xschem uses the order of pin rectangles as the default netlist pin order.
+        writeViewTopology(symbol, layers, block, compactGeometry, false);
         break;
     }
     case ViewType::Abstract: {
