@@ -515,7 +515,7 @@ void optimizePaths(std::vector<PendingPath> &paths, LayerBucket &bucket)
     }
 }
 
-std::map<std::uint32_t, LayerBucket> bucketShapes(const Block &block)
+std::map<std::uint32_t, LayerBucket> bucketShapes(const Block &block, bool detectRepetition)
 {
     std::map<std::uint32_t, LayerBucket> buckets;
     std::map<std::uint32_t, std::vector<RawRect>> pendingRects;
@@ -591,8 +591,7 @@ std::map<std::uint32_t, LayerBucket> bucketShapes(const Block &block)
                 bucket.polygonRepeats.push_back(std::move(repeat));
                 break;
             }
-            if ((polygon.columns > 1 || polygon.rows > 1) && !polygon.points.empty() &&
-                shape.properties().empty()) {
+            if ((polygon.columns > 1 || polygon.rows > 1) && !polygon.points.empty()) {
                 PolygonRepeatSpec repeat;
                 repeat.vertexCount = static_cast<std::uint32_t>(polygon.points.size());
                 appendDeltaEncoded(repeat.deltas, polygon.points);
@@ -604,6 +603,8 @@ std::map<std::uint32_t, LayerBucket> bucketShapes(const Block &block)
                 repeat.rowX = polygon.rowX;
                 repeat.originX.push_back(polygon.points.front().x);
                 repeat.originY.push_back(polygon.points.front().y);
+                repeat.properties = shape.properties();
+                // Shared properties for the whole grid (not per-placement).
                 repeat.memberProperties = false;
                 bucket.polygonRepeats.push_back(std::move(repeat));
                 break;
@@ -636,7 +637,7 @@ std::map<std::uint32_t, LayerBucket> bucketShapes(const Block &block)
                 bucket.pathRepeats.push_back(std::move(repeat));
                 break;
             }
-            if ((path.columns > 1 || path.rows > 1) && !path.points.empty() && shape.properties().empty()) {
+            if ((path.columns > 1 || path.rows > 1) && !path.points.empty()) {
                 PathRepeatSpec repeat;
                 repeat.width = path.width;
                 repeat.bgnExt = path.bgnExt;
@@ -652,36 +653,11 @@ std::map<std::uint32_t, LayerBucket> bucketShapes(const Block &block)
                 repeat.rowX = path.rowX;
                 repeat.originX.push_back(path.points.front().x);
                 repeat.originY.push_back(path.points.front().y);
+                repeat.properties = shape.properties();
+                // Shared properties for the whole grid (not per-placement).
                 repeat.memberProperties = false;
                 bucket.pathRepeats.push_back(std::move(repeat));
                 break;
-            }
-            if ((path.columns > 1 || path.rows > 1) && !path.points.empty()) {
-                const std::uint32_t columns = path.columns == 0 ? 1 : path.columns;
-                const std::uint32_t rows = path.rows == 0 ? 1 : path.rows;
-                const std::uint64_t members = static_cast<std::uint64_t>(columns) * rows;
-                if (members > 0) {
-                PathRepeatSpec repeat;
-                repeat.width = path.width;
-                repeat.bgnExt = path.bgnExt;
-                repeat.endExt = path.endExt;
-                repeat.round = path.round;
-                repeat.vertexCount = static_cast<std::uint32_t>(path.points.size());
-                appendDeltaEncoded(repeat.deltas, path.points);
-                repeat.properties = shape.properties();
-                const std::int64_t originX = path.points.front().x;
-                const std::int64_t originY = path.points.front().y;
-                repeat.originX.reserve(static_cast<std::size_t>(columns) * rows);
-                repeat.originY.reserve(static_cast<std::size_t>(columns) * rows);
-                for (std::uint32_t row = 0; row < rows; ++row) {
-                    for (std::uint32_t col = 0; col < columns; ++col) {
-                        repeat.originX.push_back(originX + static_cast<std::int64_t>(col) * path.stepX);
-                        repeat.originY.push_back(originY + static_cast<std::int64_t>(row) * path.stepY);
-                    }
-                }
-                bucket.pathRepeats.push_back(std::move(repeat));
-                break;
-                }
             }
             PendingPath pending;
             pending.width = path.width;
@@ -742,7 +718,18 @@ std::map<std::uint32_t, LayerBucket> bucketShapes(const Block &block)
     for (auto &entry : buckets) {
         const std::uint32_t layerId = entry.first;
         LayerBucket &bucket = entry.second;
-        optimizeRectangles(pendingRects[layerId], bucket);
+        if (detectRepetition) {
+            optimizeRectangles(pendingRects[layerId], bucket);
+        } else {
+            for (const RawRect &rect : pendingRects[layerId]) {
+                bucket.rectCoords.push_back(rect.llx);
+                bucket.rectCoords.push_back(rect.lly);
+                bucket.rectCoords.push_back(rect.urx);
+                bucket.rectCoords.push_back(rect.ury);
+                appendShapeProperties(bucket, rect.properties);
+            }
+            pendingRects[layerId].clear();
+        }
         for (const RectArraySpec &arraySpec : bucket.rectArrays) {
             if (arraySpec.propertiesStored || !arraySpec.memberProperties) {
                 continue;
@@ -761,7 +748,17 @@ std::map<std::uint32_t, LayerBucket> bucketShapes(const Block &block)
                 appendShapeProperties(bucket, props);
             }
         }
-        optimizePolygons(pendingPolygons[layerId], bucket);
+        if (detectRepetition) {
+            optimizePolygons(pendingPolygons[layerId], bucket);
+        } else {
+            for (auto &polygon : pendingPolygons[layerId]) {
+                bucket.polygonVertexCounts.push_back(
+                    static_cast<std::uint32_t>(polygon.first.size()));
+                appendDeltaEncoded(bucket.polygonDeltas, polygon.first);
+                appendShapeProperties(bucket, polygon.second);
+            }
+            pendingPolygons[layerId].clear();
+        }
         for (const PolygonRepeatSpec &repeat : bucket.polygonRepeats) {
             if (!repeat.memberProperties) {
                 continue;
@@ -770,7 +767,20 @@ std::map<std::uint32_t, LayerBucket> bucketShapes(const Block &block)
                 appendShapeProperties(bucket, repeat.properties);
             }
         }
-        optimizePaths(pendingPaths[layerId], bucket);
+        if (detectRepetition) {
+            optimizePaths(pendingPaths[layerId], bucket);
+        } else {
+            for (auto &path : pendingPaths[layerId]) {
+                bucket.pathWidths.push_back(path.width);
+                bucket.pathBgnExt.push_back(path.bgnExt);
+                bucket.pathEndExt.push_back(path.endExt);
+                bucket.pathRound.push_back(path.round ? 1 : 0);
+                bucket.pathVertexCounts.push_back(static_cast<std::uint32_t>(path.points.size()));
+                appendDeltaEncoded(bucket.pathDeltas, path.points);
+                appendShapeProperties(bucket, path.properties);
+            }
+            pendingPaths[layerId].clear();
+        }
         for (const PathRepeatSpec &repeat : bucket.pathRepeats) {
             if (!repeat.memberProperties) {
                 continue;
@@ -827,14 +837,29 @@ void writePackedDeltas(schema::CompactLayerShapes::Builder builder,
     }
 }
 
+void writePackedRectCoords(schema::CompactLayerShapes::Builder builder,
+                           const std::vector<std::int64_t> &coords)
+{
+    if (coords.empty()) {
+        return;
+    }
+    const std::vector<std::uint8_t> packed = encodeVarint64(coords);
+    const std::size_t listBytes = coords.size() * sizeof(std::int64_t);
+    if (packed.size() < listBytes) {
+        builder.setRectCoordsPacked(capnp::Data::Reader(packed.data(), packed.size()));
+        return;
+    }
+    auto rects = builder.initRectCoords(coords.size());
+    for (std::size_t i = 0; i < coords.size(); ++i) {
+        rects.set(i, coords[i]);
+    }
+}
+
 void writeLayerBucket(schema::CompactLayerShapes::Builder builder, const LayerBucket &bucket)
 {
     builder.setLayerId(bucket.layerId);
 
-    auto rects = builder.initRectCoords(bucket.rectCoords.size());
-    for (std::size_t i = 0; i < bucket.rectCoords.size(); ++i) {
-        rects.set(i, bucket.rectCoords[i]);
-    }
+    writePackedRectCoords(builder, bucket.rectCoords);
 
     auto arrays = builder.initRectArrays(bucket.rectArrays.size());
     for (std::size_t i = 0; i < bucket.rectArrays.size(); ++i) {
@@ -1016,14 +1041,26 @@ void readLayerBucket(schema::CompactLayerShapes::Reader reader, Emit &&emit,
         }
     };
 
-    const auto rectCoords = reader.getRectCoords();
-    for (std::size_t i = 0; i + 3 < rectCoords.size(); i += 4) {
-        Shape::RectData data;
-        data.layerId = layerId;
-        data.box = Box{rectCoords[i], rectCoords[i + 1], rectCoords[i + 2], rectCoords[i + 3]};
-        Shape shape(data);
-        assignShapeProperties(shape);
-        emit(std::move(shape));
+    const std::vector<std::int64_t> rectCoords =
+        loadPackedOrList(reader.getRectCoordsPacked(), reader.getRectCoords());
+    const std::size_t rectCount = rectCoords.size() / 4;
+    const bool bulkRects = hooks && hooks->rectCoords && rectCount > 0 && !membersHaveProperties(rectCount);
+    if (bulkRects) {
+        CompactRectCoordsRef ref;
+        ref.layerId = layerId;
+        ref.coords = rectCoords.data();
+        ref.coordCount = rectCount * 4;
+        hooks->rectCoords(ref);
+        skipMemberProperties(rectCount);
+    } else {
+        for (std::size_t i = 0; i + 3 < rectCoords.size(); i += 4) {
+            Shape::RectData data;
+            data.layerId = layerId;
+            data.box = Box{rectCoords[i], rectCoords[i + 1], rectCoords[i + 2], rectCoords[i + 3]};
+            Shape shape(data);
+            assignShapeProperties(shape);
+            emit(std::move(shape));
+        }
     }
 
     for (const auto array : reader.getRectArrays()) {
@@ -1402,9 +1439,10 @@ void readLayerBucket(schema::CompactLayerShapes::Reader reader, Emit &&emit,
 
 } // namespace
 
-void writeCompactBlock(schema::CompactBlock::Builder builder, const Block &block)
+void writeCompactBlock(schema::CompactBlock::Builder builder, const Block &block,
+                       bool detectRepetition)
 {
-    const auto buckets = bucketShapes(block);
+    const auto buckets = bucketShapes(block, detectRepetition);
     auto layers = builder.initLayerShapes(buckets.size());
     std::size_t layerIndex = 0;
     for (const auto &entry : buckets) {
